@@ -6,6 +6,7 @@ require 'digest/sha1'
 require 'date'
 require 'thread'
 require 'yaml'
+require 'active_support/core_ext/hash/indifferent_access'
 
 module JSON
 
@@ -13,32 +14,56 @@ module JSON
     class ValidationError < StandardError
       attr_accessor :fragments, :schema, :failed_attribute, :sub_errors
 
-      def initialize(message, fragments, failed_attribute, schema)
+      def initialize(message, fragments, failed_attribute, schema, options = {})
         @fragments = fragments.clone
         @schema = schema
         @sub_errors = []
         @failed_attribute = failed_attribute
-        message = "#{message} in schema #{schema.uri}"
+        @options = options
         super(message)
       end
 
+      def attribute_name(fragments)
+        "[#{fragments.join(' / ')}]"
+      end
+
       def to_string
-        if @sub_errors.empty?
+        case
+        when @sub_errors.empty?
           message
-        else
-          full_message = message + "\n The schema specific errors were:\n"
-          @sub_errors.each{|e| full_message = full_message + " - " + e.to_string + "\n"}
-          full_message
+        when @sub_errors.count==1
+          @sub_errors.first.to_string
+        else 
+         template = schema.schema.fetch(:error_message,false) || JSON::Validator.description(failed_attribute.to_s(:lower))
+         template % schema.schema.merge(attribute: attribute_name(fragments), validation_array: @sub_errors.map(&:to_string).join(', '), ).deep_symbolize_keys
         end
       end
 
       def to_hash
-        base = {:schema => @schema.uri, :fragment => ::JSON::Schema::Attribute.build_fragment(fragments), :message => message, :failed_attribute => @failed_attribute.to_s.split(":").last.split("Attribute").first}
-        if !@sub_errors.empty?
-          base[:errors] = @sub_errors.map{|e| e.to_hash}
+        base = {:schema => @schema.uri, :fragment => ::JSON::Schema::Attribute.build_fragment(fragments), :message => message, :failed_attribute => @failed_attribute.to_s(:lower)}
+        base.merge! data_attributes
+        case
+        when @sub_errors.count == 1
+          base[:message] = sub_errors.first.message
+        when !@sub_errors.empty?
+          base[:message] = sub_errors.map(&:message).each_with_index.inject('') do |col, (m,idx)| 
+            col += case
+            when sub_errors.count==1 || idx==0 then ''
+            when idx=sub_errors.count - 1 && sub_errors.count >= 2 then ' and '
+            else ' -,- '
+            end + "[#{m}]"
+          end
         end
+        base[:errors] = @sub_errors.map{|e| e.to_hash}
+        base.delete(:schema) unless @options[:include_schema_in_objects]
         base
       end
+
+      # extracts any keys that start with 'data-' or 'data_' and returns those keys with the 'data' preface stripped
+      def data_attributes
+        @schema.schema.select {|k,_| k.to_s.start_with?('data_') or k.to_s.start_with?('data-')}.inject({}) {|col,(k,v)| col[k[5..-1].to_sym]=v;col}
+      end
+
     end
 
     class SchemaError < StandardError
@@ -48,6 +73,14 @@ module JSON
     end
 
     class Attribute
+
+      attr_accessor :message
+
+      def self.to_s(modifier = nil)
+        s = super().split(":").last.split("Attribute").first
+        modifier==:lower ? uncapitalize(s) : s
+      end
+
       def self.validate(current_schema, data, fragments, processor, validator, options = {})
       end
 
@@ -55,8 +88,36 @@ module JSON
         "#/#{fragments.join('/')}"
       end
 
+      def self.attribute_name(fragments)
+        "[#{fragments.join(' / ')}]"
+      end
+
+      def self.uncapitalize(string)
+        string[0,1].downcase + string[1..-1]
+      end
+
+      def self.error_message(args)
+        # note the assignment (error_template = ...) is INTENTIONAL (this does NOT test for equality ==).
+        # if a templat exists, assign it and use it, other wise just put out the problem message.
+        if error_template = args[:schema].fetch(:error_message,JSON::Validator.description(args[:failed_attribute]))
+          message = error_template % args[:schema].deep_symbolize_keys.merge(
+              attribute: attribute_name(args[:fragments]), 
+              data: args[:data], 
+              validation_array: Array(args[:schema][args[:failed_attribute]]).join(', '))
+        else
+          message = args[:message]
+        end
+      end
+
       def self.validation_error(processor, message, fragments, current_schema, failed_attribute, record_errors)
-        error = ValidationError.new(message, fragments, failed_attribute, current_schema)
+        message = error_message(
+          data: processor.data(fragments), 
+          schema: current_schema.schema, 
+          failed_attribute: uncapitalize(failed_attribute.to_s),
+          message: message,
+          fragments: fragments
+          )
+        error = ValidationError.new(message, fragments, failed_attribute, current_schema, processor.options)
         if record_errors
           processor.validation_error(error)
         else
@@ -104,6 +165,8 @@ module JSON
 
   class Validator
 
+    attr_accessor :errors, :options
+
     @@schemas = {}
     @@cache_schemas = false
     @@default_opts = {
@@ -114,7 +177,8 @@ module JSON
       :errors_as_objects => false,
       :insert_defaults => false,
       :clear_cache => true,
-      :strict => false
+      :strict => false,
+      include_schema_in_objects: false
     }
     @@validators = {}
     @@default_validator = nil
@@ -122,6 +186,46 @@ module JSON
     @@json_backend = nil
     @@serializer = nil
     @@mutex = Mutex.new
+
+    def data(fragments = [])
+      # pull the data out based on the path passed (fragments)
+      fragments.inject(ActiveSupport::HashWithIndifferentAccess.new(@data),:fetch)
+    end
+
+    def self.description(key)
+      @descriptions ||= ActiveSupport::HashWithIndifferentAccess.new(
+        {
+          typeV4: '%{attribute} must a %{type}',
+          type: '%{attribute} must a %{type}',
+          allOf: '%{attribute} must meet all of the follow criteria: [%{validation_array}]',
+          anyOf: '%{attribute} must meet at least one of the following criteria: [%{validation_array}]',
+          oneOf: '%{attribute} must meet exactly one of the following criteria: [%{validation_array}]',
+          "not" => 'Must not meet this critera',
+          disallow: 'Description for disallow', 
+          format: '%{attribute} must be in this format',
+          maximum: '%{attribute} must be at most %{maximum}',
+          minimum: '%{attribute} must be at least %{minimum}',
+          minItems: '%{attribute} must have at most %{minItems} items',
+          maxItems: '%{attribute} must have at least %{maxItems} items',
+          minProperties: '%{attribute} must have at least %{minProperties} properties',
+          maxProperties: '%{attribute} must have at least %{maxProperties} properties',
+          uniqueItems: '%{attribute} must have unique items',
+          minLength: '%{attribute} must be at least %{minLength} characters', 
+          maxLength: '%{attribute} must be at most %{maxLength} characters',
+          multipleOf: '%{attribute} must be a multiple of %{multipleOf}',
+          enum: '%{attribute} must be one of the following values: [%{validation_array}]',
+          properties: '%{attribute} must have the following properties: %{properties}',
+          required: 'The following properties are required: [%{validation_array}]', 
+          pattern: 'The value must meet the pattern %{pattern}',
+          patternProperties: 'The property key must meet the pattern %{pattern}',
+          additionalProperties: 'Additional properties beyond those specified are not allowed',
+          items: 'Items are required',
+          additionalItems: 'Additional items are not allowed',
+          dependencies: 'Dependencies Description',
+          extends: 'Extends description'
+        })
+      @descriptions.fetch(key,nil)
+    end
 
     def self.version_string_for(version)
       # I'm not a fan of this, but it's quick and dirty to get it working for now
@@ -145,9 +249,10 @@ module JSON
     end
 
     def initialize(schema_data, data, opts={})
+      schema_data = ActiveSupport::HashWithIndifferentAccess.new(schema_data)
+      data = ActiveSupport::HashWithIndifferentAccess.new(data)
       @options = @@default_opts.clone.merge(opts)
       @errors = []
-
       # I'm not a fan of this, but it's quick and dirty to get it working for now
       version_string = "draft-04"
       if @options[:version]
